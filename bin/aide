@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Resolve AIDE_ROOT (follow symlinks to find repo root) ────────────────────
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+AIDE_ROOT=$(cd -P "$(dirname "$SOURCE")/.." && pwd)
+
+IMAGE_NAME="aide:latest"
+
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+aide — Claude Code in a secure container
+
+Usage:
+  aide                      Launch Claude Code interactively in $PWD
+  aide build                Build the aide Docker image
+  aide pull                 Update aide (git pull + rebuild)
+  aide -m <path>            Mount path read-only at /extra/<basename>
+  aide -mw <path>           Mount path read-write at /extra/<basename>
+  aide -p "prompt"          Non-interactive mode (auto-accepts permissions)
+  aide --caffeinate|-c      Prevent machine sleep during run (macOS)
+  aide --dangerous|-d       Skip all permission prompts (dangerously-skip-permissions)
+  aide -- <flags>           Pass extra flags to docker run
+
+Environment:
+  AIDE_EXTRA_DOMAINS        Optional. Space-separated FQDNs to allow through firewall.
+                            Also merged from firewall-domains.local.txt (gitignored) if present.
+EOF
+}
+
+die() {
+  echo "aide: error: $*" >&2
+  exit 1
+}
+
+preflight() {
+  if ! command -v docker &>/dev/null; then
+    die "Docker is not installed or not in PATH"
+  fi
+  if ! docker info &>/dev/null 2>&1; then
+    die "Docker daemon is not running"
+  fi
+}
+
+image_exists() {
+  docker image inspect "$IMAGE_NAME" &>/dev/null 2>&1
+}
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_build() {
+  local build_args=()
+
+  # Auto-inject corporate CA cert: check certs/ dir, then AIDE_CA_CERT_FILE env
+  local cert_file="${AIDE_CA_CERT_FILE:-}"
+  if [[ -z "$cert_file" ]]; then
+    # Use first cert found in certs/ directory
+    for f in "$AIDE_ROOT"/certs/*.crt "$AIDE_ROOT"/certs/*.pem "$AIDE_ROOT"/certs/*.cer; do
+      [[ -f "$f" ]] && { cert_file="$f"; break; }
+    done
+  fi
+  if [[ -n "$cert_file" ]]; then
+    echo "aide: injecting CA cert from $cert_file"
+    build_args+=(--build-arg "EXTRA_CA_CERT_B64=$(base64 < "$cert_file" | tr -d '\n')")
+  fi
+
+  echo "aide: building image..."
+  docker build -t "$IMAGE_NAME" "${build_args[@]}" "$AIDE_ROOT"
+}
+
+cmd_pull() {
+  echo "aide: updating..."
+  git -C "$AIDE_ROOT" pull --ff-only
+  cmd_build
+}
+
+cmd_run() {
+  preflight
+
+  if ! image_exists; then
+    echo "aide: image not found, building first..."
+    cmd_build
+  fi
+
+  local extra_mounts=()
+  local extra_docker_flags=()
+  local claude_args=()
+  local noninteractive=false
+  local caffeinate=false
+  local dangerous=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m)
+        [[ -z "${2:-}" ]] && die "-m requires a path argument"
+        local src
+        src=$(cd "$2" && pwd)
+        local base
+        base=$(basename "$src")
+        extra_mounts+=(-v "$src:/extra/$base:ro")
+        shift 2
+        ;;
+      -mw)
+        [[ -z "${2:-}" ]] && die "-mw requires a path argument"
+        local src_rw
+        src_rw=$(cd "$2" && pwd)
+        local base_rw
+        base_rw=$(basename "$src_rw")
+        extra_mounts+=(-v "$src_rw:/extra/$base_rw")
+        shift 2
+        ;;
+      -p)
+        [[ -z "${2:-}" ]] && die "-p requires a prompt argument"
+        noninteractive=true
+        claude_args+=(-p "$2")
+        shift 2
+        ;;
+      --caffeinate|-c)
+        caffeinate=true
+        shift
+        ;;
+      --dangerous|-d)
+        dangerous=true
+        shift
+        ;;
+      --)
+        shift
+        extra_docker_flags+=("$@")
+        break
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1 (use -- to pass flags to docker run)"
+        ;;
+    esac
+  done
+
+  # Read host git identity for use inside the container
+  local git_name git_email
+  git_name=$(git config --global user.name 2>/dev/null || true)
+  git_email=$(git config --global user.email 2>/dev/null || true)
+  if [[ -z "$git_name" || -z "$git_email" ]]; then
+    echo "aide: warning: host git user.name or user.email not set; commits inside container may use defaults" >&2
+  fi
+
+  local docker_flags=(
+    --rm
+    --init
+    --cap-add=NET_ADMIN
+    --cap-add=NET_RAW
+    -v "$PWD:/workspace"
+    -v aide-claude:/home/aide/.claude
+    -e ANTHROPIC_API_KEY
+    -e "ANTHROPIC_BASE_URL=https://api.anthropic.com"
+    -w /workspace
+  )
+
+  # Mount skills/ into ~/.claude/skills/ if the directory exists
+  if [[ -d "$AIDE_ROOT/skills" ]]; then
+    docker_flags+=(-v "$AIDE_ROOT/skills:/home/aide/.claude/skills:ro")
+  fi
+
+  # Mount commands/ into ~/.claude/commands/ if the directory exists
+  if [[ -d "$AIDE_ROOT/commands" ]]; then
+    docker_flags+=(-v "$AIDE_ROOT/commands:/home/aide/.claude/commands:ro")
+  fi
+
+  # Pass git identity as env vars
+  if [[ -n "$git_name" ]]; then
+    docker_flags+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+  fi
+  if [[ -n "$git_email" ]]; then
+    docker_flags+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
+  fi
+
+  # Merge firewall-domains.local (gitignored) into AIDE_EXTRA_DOMAINS
+  local local_domains_file="$AIDE_ROOT/firewall-domains.local.txt"
+  if [[ -f "$local_domains_file" ]]; then
+    local file_domains
+    file_domains=$(grep -v '^\s*#' "$local_domains_file" | tr '\n' ' ' | xargs || true)
+    if [[ -n "$file_domains" ]]; then
+      AIDE_EXTRA_DOMAINS="${AIDE_EXTRA_DOMAINS:+$AIDE_EXTRA_DOMAINS }$file_domains"
+    fi
+  fi
+
+  # Pass through AIDE_EXTRA_DOMAINS if set
+  if [[ -n "${AIDE_EXTRA_DOMAINS:-}" ]]; then
+    docker_flags+=(-e AIDE_EXTRA_DOMAINS)
+  fi
+
+  # Pass host CWD name so the container statusline can show the real project name
+  local project_name
+  project_name=$(basename "$PWD")
+  docker_flags+=(-e "AIDE_PROJECT_NAME=$project_name")
+
+  # Interactive TTY unless non-interactive mode
+  if [[ "$noninteractive" == false ]]; then
+    docker_flags+=(-it)
+  fi
+
+  # workaround for bash to not expand arrays with empty values
+  docker_flags+=(${extra_mounts[@]+"${extra_mounts[@]}"})
+  docker_flags+=(${extra_docker_flags[@]+"${extra_docker_flags[@]}"})
+
+  # acceptEdits is default on; dangerous mode skips all permission prompts
+  if [[ "$dangerous" == true ]]; then
+    claude_args+=(--dangerously-skip-permissions)
+  else
+    claude_args+=(--permission-mode acceptEdits)
+  fi
+
+  local runner=()
+  if [[ "$caffeinate" == true ]]; then
+    if command -v caffeinate &>/dev/null; then
+      runner=(caffeinate)
+    else
+      echo "aide: warning: caffeinate not found in PATH, ignoring --caffeinate" >&2
+    fi
+  fi
+
+  "${runner[@]+"${runner[@]}"}" docker run "${docker_flags[@]}" "$IMAGE_NAME" claude ${claude_args[@]+"${claude_args[@]}"}
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  build)
+    cmd_build
+    ;;
+  pull)
+    cmd_pull
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    cmd_run "$@"
+    ;;
+esac
