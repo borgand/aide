@@ -7,7 +7,7 @@ Claude Code in a secure, network-isolated Docker container.
 ## Quick Start
 
 ```bash
-git clone git@gitlab.lhv.eu/.../aide.git ~/aide
+git clone https://github.com/your-org/aide.git ~/aide
 ~/aide/install.sh
 aide
 ```

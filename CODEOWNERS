@@ -1,15 +1,4 @@
-[Owner] @teams/sg_ee_role_bank_tmgt_developer_experience_team
-*
-
-[Deployments] @teams/sg_ee_role_bank_pd_devops_engineer
-/deploy/
-
-[Security] @teams/sg_ee_role_bank_application_security_scan_reviewers
-.trivyignore
-
-[Pipeline] @teams/sg_ee_role_bank_service_gitlab_pipeline_reviewers
-/.gitlab-ci.yml
-/.gitlab/
-
-[Approvals] @teams/sg_ee_role_bank_service_gitlab_codeowners_reviewers
-/CODEOWNERS
+# CODEOWNERS — assign reviewers for pull requests
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# * @your-org/maintainers
