@@ -1,0 +1,23 @@
+# Claude Code local settings (user-specific overrides)
+.claude/
+settings.local.json
+
+# Active skills (user-specific selection)
+skills/*
+!skills/.gitkeep
+
+# Active commands (user-specific selection)
+commands/*
+!commands/.gitkeep
+
+# Local firewall domain overrides (private/internal domains — not committed)
+firewall-domains.local.txt
+
+# macOS
+.DS_Store
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+.*.swp

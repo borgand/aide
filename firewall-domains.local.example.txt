@@ -1,0 +1,9 @@
+# firewall-domains.local — private/internal domains to allow through the firewall
+# Copy this file to firewall-domains.local.txt and add your entries.
+# firewall-domains.local.txt is gitignored so internal domains stay out of the repo.
+#
+# One domain per line. Lines starting with # are ignored.
+#
+# Example:
+# gitlab.internal.example.com
+# registry.internal.example.com
