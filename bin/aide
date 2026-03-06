@@ -73,7 +73,7 @@ cmd_build() {
   fi
 
   echo "aide: building image..."
-  docker build -t "$IMAGE_NAME" "${build_args[@]}" "$AIDE_ROOT"
+  docker build -t "$IMAGE_NAME" ${build_args[@]+"${build_args[@]}"} "$AIDE_ROOT"
 }
 
 cmd_pull() {
