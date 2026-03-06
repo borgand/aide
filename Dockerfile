@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ipset \
       iproute2 \
       dnsutils \
+      socat \
+      openssh-client \
       python3 \
       python3-venv \
       pipx \

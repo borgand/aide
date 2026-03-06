@@ -22,6 +22,7 @@ Usage:
   aide                      Launch Claude Code interactively in $PWD
   aide build                Build the aide Docker image
   aide pull                 Update aide (git pull + rebuild)
+  aide shell                Drop into a bash shell in the container (for debugging)
   aide -m <path>            Mount path read-only at /extra/<basename>
   aide -mw <path>           Mount path read-write at /extra/<basename>
   aide -p "prompt"          Non-interactive mode (auto-accepts permissions)
@@ -81,7 +82,7 @@ cmd_pull() {
   cmd_build
 }
 
-cmd_run() {
+setup_docker_flags() {
   preflight
 
   if ! image_exists; then
@@ -89,6 +90,85 @@ cmd_run() {
     cmd_build
   fi
 
+  # Read host git identity for use inside the container
+  git_name=$(git config --global user.name 2>/dev/null || true)
+  git_email=$(git config --global user.email 2>/dev/null || true)
+  if [[ -z "$git_name" || -z "$git_email" ]]; then
+    echo "aide: warning: host git user.name or user.email not set; commits inside container may use defaults" >&2
+  fi
+
+  docker_flags=(
+    --rm
+    --init
+    --cap-add=NET_ADMIN
+    --cap-add=NET_RAW
+    -v "$PWD:/workspace"
+    -v aide-claude:/home/aide/.claude
+    -e ANTHROPIC_API_KEY
+    -e "ANTHROPIC_BASE_URL=https://api.anthropic.com"
+    -w /workspace
+  )
+
+  # Mount skills/ into ~/.claude/skills/ if the directory exists (rw so agent can persist new skills)
+  if [[ -d "$AIDE_ROOT/skills" ]]; then
+    docker_flags+=(-v "$AIDE_ROOT/skills:/home/aide/.claude/skills")
+  fi
+
+  # Mount commands/ into ~/.claude/commands/ if the directory exists (rw so agent can persist new commands)
+  if [[ -d "$AIDE_ROOT/commands" ]]; then
+    docker_flags+=(-v "$AIDE_ROOT/commands:/home/aide/.claude/commands")
+  fi
+
+  # Pass git identity as env vars
+  if [[ -n "$git_name" ]]; then
+    docker_flags+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+  fi
+  if [[ -n "$git_email" ]]; then
+    docker_flags+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
+  fi
+
+  # Merge firewall-domains.local (gitignored) into AIDE_EXTRA_DOMAINS
+  local local_domains_file="$AIDE_ROOT/firewall-domains.local.txt"
+  if [[ -f "$local_domains_file" ]]; then
+    local file_domains
+    file_domains=$(grep -v '^\s*#' "$local_domains_file" | tr '\n' ' ' | xargs || true)
+    if [[ -n "$file_domains" ]]; then
+      export AIDE_EXTRA_DOMAINS="${AIDE_EXTRA_DOMAINS:+$AIDE_EXTRA_DOMAINS }$file_domains"
+    fi
+  fi
+
+  # Pass through AIDE_EXTRA_DOMAINS if set
+  if [[ -n "${AIDE_EXTRA_DOMAINS:-}" ]]; then
+    docker_flags+=(-e AIDE_EXTRA_DOMAINS)
+  fi
+
+  # Forward SSH agent socket if available (key never enters container)
+  # On macOS, Docker VMs (Docker Desktop, Rancher Desktop) cannot bind-mount
+  # Unix domain sockets. Use socat to TCP-proxy via host.docker.internal.
+  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      if ! command -v socat &>/dev/null; then
+        echo "aide: warning: socat not found; SSH agent will not be forwarded (install socat)" >&2
+      else
+        local ssh_proxy_port
+        ssh_proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+        socat TCP-LISTEN:"$ssh_proxy_port",bind=0.0.0.0,reuseaddr,fork UNIX-CONNECT:"$SSH_AUTH_SOCK" &
+        SSH_PROXY_PID=$!
+        trap "kill $SSH_PROXY_PID 2>/dev/null || true" EXIT
+        docker_flags+=(-e "SSH_AGENT_PROXY_PORT=$ssh_proxy_port")
+      fi
+    else
+      docker_flags+=(-v "$SSH_AUTH_SOCK:/tmp/ssh_agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh_agent.sock")
+    fi
+  fi
+
+  # Pass host CWD name so the container statusline can show the real project name
+  local project_name
+  project_name=$(basename "$PWD")
+  docker_flags+=(-e "AIDE_PROJECT_NAME=$project_name")
+}
+
+cmd_run() {
   local extra_mounts=()
   local extra_docker_flags=()
   local claude_args=()
@@ -145,63 +225,8 @@ cmd_run() {
     esac
   done
 
-  # Read host git identity for use inside the container
-  local git_name git_email
-  git_name=$(git config --global user.name 2>/dev/null || true)
-  git_email=$(git config --global user.email 2>/dev/null || true)
-  if [[ -z "$git_name" || -z "$git_email" ]]; then
-    echo "aide: warning: host git user.name or user.email not set; commits inside container may use defaults" >&2
-  fi
-
-  local docker_flags=(
-    --rm
-    --init
-    --cap-add=NET_ADMIN
-    --cap-add=NET_RAW
-    -v "$PWD:/workspace"
-    -v aide-claude:/home/aide/.claude
-    -e ANTHROPIC_API_KEY
-    -e "ANTHROPIC_BASE_URL=https://api.anthropic.com"
-    -w /workspace
-  )
-
-  # Mount skills/ into ~/.claude/skills/ if the directory exists
-  if [[ -d "$AIDE_ROOT/skills" ]]; then
-    docker_flags+=(-v "$AIDE_ROOT/skills:/home/aide/.claude/skills:ro")
-  fi
-
-  # Mount commands/ into ~/.claude/commands/ if the directory exists
-  if [[ -d "$AIDE_ROOT/commands" ]]; then
-    docker_flags+=(-v "$AIDE_ROOT/commands:/home/aide/.claude/commands:ro")
-  fi
-
-  # Pass git identity as env vars
-  if [[ -n "$git_name" ]]; then
-    docker_flags+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
-  fi
-  if [[ -n "$git_email" ]]; then
-    docker_flags+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
-  fi
-
-  # Merge firewall-domains.local (gitignored) into AIDE_EXTRA_DOMAINS
-  local local_domains_file="$AIDE_ROOT/firewall-domains.local.txt"
-  if [[ -f "$local_domains_file" ]]; then
-    local file_domains
-    file_domains=$(grep -v '^\s*#' "$local_domains_file" | tr '\n' ' ' | xargs || true)
-    if [[ -n "$file_domains" ]]; then
-      AIDE_EXTRA_DOMAINS="${AIDE_EXTRA_DOMAINS:+$AIDE_EXTRA_DOMAINS }$file_domains"
-    fi
-  fi
-
-  # Pass through AIDE_EXTRA_DOMAINS if set
-  if [[ -n "${AIDE_EXTRA_DOMAINS:-}" ]]; then
-    docker_flags+=(-e AIDE_EXTRA_DOMAINS)
-  fi
-
-  # Pass host CWD name so the container statusline can show the real project name
-  local project_name
-  project_name=$(basename "$PWD")
-  docker_flags+=(-e "AIDE_PROJECT_NAME=$project_name")
+  local docker_flags=() git_name="" git_email=""
+  setup_docker_flags
 
   # Interactive TTY unless non-interactive mode
   if [[ "$noninteractive" == false ]]; then
@@ -231,6 +256,13 @@ cmd_run() {
   "${runner[@]+"${runner[@]}"}" docker run "${docker_flags[@]}" "$IMAGE_NAME" claude ${claude_args[@]+"${claude_args[@]}"}
 }
 
+cmd_shell() {
+  local docker_flags=() git_name="" git_email=""
+  setup_docker_flags
+  docker_flags+=(-it)
+  docker run "${docker_flags[@]}" "$IMAGE_NAME" bash
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -239,6 +271,9 @@ case "${1:-}" in
     ;;
   pull)
     cmd_pull
+    ;;
+  shell)
+    cmd_shell
     ;;
   -h|--help)
     usage

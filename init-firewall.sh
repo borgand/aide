@@ -88,6 +88,14 @@ if [[ -n "$DEFAULT_GW" ]]; then
 fi
 
 # ── Build ipset of allowed IPs ───────────────────────────────────────────────
+# Allow host.docker.internal for SSH agent proxy
+if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then
+  HOST_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+  if [[ -n "$HOST_IP" ]]; then
+    iptables -A OUTPUT -d "$HOST_IP" -p tcp --dport "$SSH_AGENT_PROXY_PORT" -j ACCEPT
+  fi
+fi
+
 ipset create allowed-domains hash:net
 
 IP_REGEX='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'

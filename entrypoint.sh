@@ -44,5 +44,12 @@ if [[ -n "${GIT_AUTHOR_NAME:-}" || -n "${GIT_AUTHOR_EMAIL:-}" ]]; then
   unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 fi
 
+# Set up SSH agent forwarding via TCP proxy (macOS host → container)
+if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then
+  socat UNIX-LISTEN:/tmp/ssh_agent.sock,fork,user=aide,group=aide,mode=600 \
+    TCP:host.docker.internal:"$SSH_AGENT_PROXY_PORT" &
+  export SSH_AUTH_SOCK=/tmp/ssh_agent.sock
+fi
+
 # Drop privileges and execute CMD as aide user
 exec gosu aide "$@"

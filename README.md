@@ -148,6 +148,44 @@ The certificate is base64-encoded and passed as a Docker build argument. It take
 
 Both methods run `update-ca-certificates` during the build and also set `NODE_EXTRA_CA_CERTS` so Node.js (and Claude Code) trusts the certificate.
 
+## SSH / Git Authentication for Private Repositories
+
+aide forwards your host SSH agent into the container so private GitLab/GitHub repos work without putting credentials inside the image. The private key **never enters the container**.
+
+### Setup
+
+1. **Install `socat` on your Mac** (required for SSH agent forwarding):
+   ```bash
+   brew install socat
+   ```
+
+2. **Ensure your SSH key is loaded on the host:**
+   ```bash
+   ssh-add ~/.ssh/id_ed25519   # or id_rsa, etc.
+   ssh-add -l                   # verify it's loaded
+   ```
+
+3. **Launch aide** — if `SSH_AUTH_SOCK` is set in your shell, the agent is forwarded automatically. No extra flags needed.
+
+4. **Use SSH URLs** when cloning or installing plugins from private repos:
+   ```bash
+   # Instead of: https://gitlab.lhv.eu/group/repo.git
+   /plugin marketplace add git@gitlab.lhv.eu:group/repo.git
+   ```
+
+   Or configure git to rewrite HTTPS → SSH for your GitLab host inside the container:
+   ```bash
+   git config --global url."git@gitlab.lhv.eu:".insteadOf "https://gitlab.lhv.eu/"
+   ```
+
+### How it works
+
+On **Linux**, `bin/aide` bind-mounts the `SSH_AUTH_SOCK` socket directly into the container.
+
+On **macOS**, Docker VMs (Docker Desktop, Rancher Desktop) cannot bind-mount Unix domain sockets. Instead, `aide` starts a `socat` TCP proxy on the host that bridges `SSH_AUTH_SOCK` to a TCP port. Inside the container, another `socat` instance creates a Unix socket that connects back to the host via `host.docker.internal`. The firewall allows this specific connection. No key material is copied.
+
+> **macOS note:** Run `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` once to add your key to the Keychain — it will auto-load across reboots.
+
 ## Skills
 
 Skills are reusable instruction sets that Claude Code auto-discovers from `~/.claude/skills/<name>/SKILL.md`. aide provides a simple distribution mechanism with two directories:
