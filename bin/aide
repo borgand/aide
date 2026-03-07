@@ -149,54 +149,11 @@ resolve_docker_socket() {
 }
 
 # extract_kube_server <kubeconfig-path>
-# Returns the server URL of the current-context cluster.
+# Returns the server URL of the current-context cluster, or empty if kubectl is unavailable.
 extract_kube_server() {
   local kube="$1"
-  python3 - "$kube" <<'EOF'
-import sys, re
-
-kube_path = sys.argv[1]
-with open(kube_path) as f:
-    content = f.read()
-
-# Find current-context
-ctx_match = re.search(r'^current-context:\s*(.+)$', content, re.MULTILINE)
-if not ctx_match:
-    sys.exit(0)
-ctx_name = ctx_match.group(1).strip()
-
-# Find the cluster name for this context
-in_ctx = False
-cluster_name = None
-for line in content.splitlines():
-    if re.match(r'\s*-\s*context:', line):
-        in_ctx = True
-        cluster_name = None
-    elif in_ctx and re.match(r'\s*cluster:\s*(.+)', line):
-        cluster_name = re.match(r'\s*cluster:\s*(.+)', line).group(1).strip()
-    elif in_ctx and re.match(r'\s*name:\s*(.+)', line):
-        name = re.match(r'\s*name:\s*(.+)', line).group(1).strip()
-        if name == ctx_name and cluster_name:
-            break
-        in_ctx = False
-
-if not cluster_name:
-    sys.exit(0)
-
-# Find server for that cluster
-in_cluster = False
-for line in content.splitlines():
-    if re.match(r'\s*-\s*cluster:', line):
-        in_cluster = True
-    elif in_cluster and re.match(r'\s*server:\s*(.+)', line):
-        print(re.match(r'\s*server:\s*(.+)', line).group(1).strip())
-        break
-    elif in_cluster and re.match(r'\s*name:\s*(.+)', line):
-        name = re.match(r'\s*name:\s*(.+)', line).group(1).strip()
-        if name == cluster_name:
-            continue
-        in_cluster = False
-EOF
+  command -v kubectl &>/dev/null || return 0
+  KUBECONFIG="$kube" kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
 }
 
 # is_local_server <server-url>
@@ -327,20 +284,40 @@ setup_docker_flags() {
   if [[ -n "$kube_val" ]]; then
     kube_val="${kube_val/#\~/$HOME}"
     [[ -f "$kube_val" ]] || die "--kube: file not found: $kube_val"
-    docker_flags+=(
-      -v "$kube_val:/home/aide/.kube/config:ro"
-      -e "KUBECONFIG=/home/aide/.kube/config"
-    )
-    echo "aide: mounting kubeconfig: $kube_val"
 
-    # Detect local cluster → pass port for DNAT
+    local tmp_kube_dir
+    tmp_kube_dir=$(mktemp -d "$HOME/.aide-kube-XXXXXX")
+
+    # Detect local cluster → socat proxy on host + DNAT in container
+    # (Rancher/k3s binds to 127.0.0.1 only; socat bridges it to the docker bridge IP)
     local server port
     server=$(extract_kube_server "$kube_val")
     if [[ -n "$server" ]] && is_local_server "$server"; then
       port=$(extract_port "$server")
-      docker_flags+=(-e "AIDE_KUBE_LOCAL_PORT=$port")
-      echo "aide: local K8s cluster detected (port ${port}) — DNAT will be applied in container"
+      if ! command -v socat &>/dev/null; then
+        echo "aide: warning: socat not found; local K8s cluster (${server}) not accessible — install socat" >&2
+        cp "$kube_val" "$tmp_kube_dir/config"
+      else
+        local proxy_port kube_proxy_pid
+        proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+        # Rewrite server URL directly into tmp dir (keeps 127.0.0.1 so TLS SANs still match)
+        sed -E "s,https://(127\\.0\\.0\\.1|localhost):[0-9]+,https://127.0.0.1:${proxy_port},g" \
+          "$kube_val" > "$tmp_kube_dir/config"
+        socat "TCP-LISTEN:${proxy_port},bind=0.0.0.0,reuseaddr,fork" "TCP:127.0.0.1:${port}" &
+        kube_proxy_pid=$!
+        docker_flags+=(-e "AIDE_KUBE_LOCAL_PORT=$proxy_port")
+        echo "aide: local K8s socat proxy active (:${proxy_port} → 127.0.0.1:${port}) — in-container proxy will forward via host.docker.internal"
+      fi
+    else
+      cp "$kube_val" "$tmp_kube_dir/config"
     fi
+    chmod 600 "$tmp_kube_dir/config"
+
+    docker_flags+=(
+      -v "$tmp_kube_dir:/home/aide/.kube:ro"
+      -e "KUBECONFIG=/home/aide/.kube/config"
+    )
+    echo "aide: mounting kubeconfig: $kube_val"
   fi
 
   # Merge firewall-domains.local (gitignored) into AIDE_EXTRA_DOMAINS
@@ -370,7 +347,6 @@ setup_docker_flags() {
         ssh_proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
         socat TCP-LISTEN:"$ssh_proxy_port",bind=0.0.0.0,reuseaddr,fork UNIX-CONNECT:"$SSH_AUTH_SOCK" &
         SSH_PROXY_PID=$!
-        trap "kill $SSH_PROXY_PID 2>/dev/null || true" EXIT
         docker_flags+=(-e "SSH_AGENT_PROXY_PORT=$ssh_proxy_port")
       fi
     else
@@ -382,6 +358,10 @@ setup_docker_flags() {
   local project_name
   project_name=$(basename "$PWD")
   docker_flags+=(-e "AIDE_PROJECT_NAME=$project_name")
+
+  # Single combined cleanup trap for all background proxies and temp files
+  # (covers SSH proxy, kube proxy, and temp kubeconfig — whichever are active)
+  trap "kill ${SSH_PROXY_PID:-} 2>/dev/null || true; kill ${kube_proxy_pid:-} 2>/dev/null || true${tmp_kube_dir:+; rm -rf '$tmp_kube_dir'}" EXIT
 }
 
 cmd_run() {
@@ -401,6 +381,7 @@ cmd_run() {
       shell)
         shell_mode=true
         shift
+        break  # remaining args are an optional command to run inside the shell
         ;;
       --docker)
         if [[ -n "${2:-}" && "${2}" != --* ]]; then
@@ -475,8 +456,13 @@ cmd_run() {
   docker_flags+=(${extra_docker_flags[@]+"${extra_docker_flags[@]}"})
 
   if [[ "$shell_mode" == true ]]; then
-    docker_flags+=(-it)
-    docker run "${docker_flags[@]}" "$IMAGE_NAME" bash
+    if [[ $# -gt 0 ]]; then
+      # One-off command: run non-interactively
+      docker run "${docker_flags[@]}" "$IMAGE_NAME" bash -c "$*"
+    else
+      docker_flags+=(-it)
+      docker run "${docker_flags[@]}" "$IMAGE_NAME" bash
+    fi
     return
   fi
 

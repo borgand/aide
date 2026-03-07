@@ -69,6 +69,19 @@ if [[ ! -f "$SSH_CONFIG" ]] || ! grep -q "UserKnownHostsFile" "$SSH_CONFIG"; the
   chown aide:aide "$SSH_CONFIG"
 fi
 
+# Set up in-container socat proxy for local Kubernetes cluster
+# (DNAT of loopback traffic is unreliable with nf_tables; socat is simpler and portable)
+if [[ -n "${AIDE_KUBE_LOCAL_PORT:-}" ]]; then
+  HOST_IP=$(getent hosts host.docker.internal | awk '{print $1}' 2>/dev/null || true)
+  if [[ -n "$HOST_IP" ]]; then
+    socat TCP-LISTEN:"$AIDE_KUBE_LOCAL_PORT",bind=127.0.0.1,reuseaddr,fork \
+      TCP:"$HOST_IP":"$AIDE_KUBE_LOCAL_PORT" &
+    echo "aide: in-container kube proxy active (127.0.0.1:${AIDE_KUBE_LOCAL_PORT} → ${HOST_IP}:${AIDE_KUBE_LOCAL_PORT})"
+  else
+    echo "aide: WARNING — host.docker.internal not resolvable; local K8s proxy skipped" >&2
+  fi
+fi
+
 # Set up SSH agent forwarding via TCP proxy (macOS host → container)
 if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then
   socat UNIX-LISTEN:/tmp/ssh_agent.sock,fork,user=aide,group=aide,mode=600 \

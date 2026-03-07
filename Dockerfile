@@ -112,16 +112,9 @@ RUN npx playwright install-deps chromium
 # ── Non-root user (NO sudoers) ───────────────────────────────────────────────
 RUN groupadd -g 1000 aide \
     && useradd -m -u 1000 -g aide -s /usr/bin/zsh aide \
-    && mkdir -p /home/aide/.ssh \
+    && mkdir -p /home/aide/.ssh /home/aide/.kube \
     && chmod 700 /home/aide/.ssh \
-    && chown aide:aide /home/aide/.ssh
-
-# ── Copy scripts ─────────────────────────────────────────────────────────────
-COPY entrypoint.sh init-firewall.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/init-firewall.sh
-COPY settings.json /etc/aide/policy.json
-COPY statusline.py /usr/local/bin/aide-statusline
-RUN chmod +x /usr/local/bin/aide-statusline
+    && chown -R aide:aide /home/aide/.ssh /home/aide/.kube
 
 # ── Environment ──────────────────────────────────────────────────────────────
 ENV ANTHROPIC_BASE_URL=https://api.anthropic.com \
@@ -149,6 +142,13 @@ RUN sh -c "$(curl -fsSL https://github.com/deluan/zsh-in-docker/releases/latest/
 # ── Switch back to root for entrypoint ───────────────────────────────────────
 USER root
 WORKDIR /workspace
+
+# ── Copy scripts ─────────────────────────────────────────────────────────────
+COPY entrypoint.sh init-firewall.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/init-firewall.sh
+COPY settings.json /etc/aide/policy.json
+COPY statusline.py /usr/local/bin/aide-statusline
+RUN chmod +x /usr/local/bin/aide-statusline
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["claude"]
