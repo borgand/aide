@@ -15,6 +15,7 @@ ALLOWED_DOMAINS=(
   proxy.golang.org
   sum.golang.org
   github.com
+  gitlab.com
   objects.githubusercontent.com
   playwright.azureedge.net
 )

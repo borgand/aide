@@ -71,7 +71,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # ── GitLab CLI (glab) ─────────────────────────────────────────────────────────
 RUN ARCH=$(dpkg --print-architecture) \
-    && GLAB_VERSION=$(curl -fsSL https://api.github.com/repos/gitlab-org/cli/releases/latest \
+    && GLAB_VERSION=$(curl -fsSL "https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/releases?per_page=1" \
        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/') \
     && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${ARCH}.deb" \
        -o /tmp/glab.deb \
