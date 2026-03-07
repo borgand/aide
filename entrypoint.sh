@@ -60,6 +60,14 @@ chown aide:aide "$SSH_DIR"
 rm -f "$SSH_DIR/known_hosts"
 ln -sf "$SSH_KNOWN_HOSTS_STORE" "$SSH_DIR/known_hosts"
 chown -h aide:aide "$SSH_DIR/known_hosts"
+# Write ssh config pointing at the volume-backed known_hosts (belt-and-suspenders:
+# if the symlink above somehow goes missing, SSH still uses the persisted store)
+SSH_CONFIG="$SSH_DIR/config"
+if [[ ! -f "$SSH_CONFIG" ]] || ! grep -q "UserKnownHostsFile" "$SSH_CONFIG"; then
+  printf 'Host *\n  UserKnownHostsFile %s\n' "$SSH_KNOWN_HOSTS_STORE" >> "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+  chown aide:aide "$SSH_CONFIG"
+fi
 
 # Set up SSH agent forwarding via TCP proxy (macOS host → container)
 if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then

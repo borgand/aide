@@ -74,7 +74,10 @@ RUN npx playwright install-deps chromium
 
 # ── Non-root user (NO sudoers) ───────────────────────────────────────────────
 RUN groupadd -g 1000 aide \
-    && useradd -m -u 1000 -g aide -s /usr/bin/zsh aide
+    && useradd -m -u 1000 -g aide -s /usr/bin/zsh aide \
+    && mkdir -p /home/aide/.ssh \
+    && chmod 700 /home/aide/.ssh \
+    && chown aide:aide /home/aide/.ssh
 
 # ── Copy scripts ─────────────────────────────────────────────────────────────
 COPY entrypoint.sh init-firewall.sh /usr/local/bin/
