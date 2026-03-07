@@ -13,6 +13,9 @@ commands/*
 # Local firewall domain overrides (private/internal domains — not committed)
 firewall-domains.local.txt
 
+# Per-engineer aide config overrides (not committed)
+aide.local.yaml
+
 # macOS
 .DS_Store
 

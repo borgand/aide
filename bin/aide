@@ -28,17 +28,193 @@ Usage:
   aide -p "prompt"          Non-interactive mode (auto-accepts permissions)
   aide --caffeinate|-c      Prevent machine sleep during run (macOS)
   aide --dangerous|-d       Skip all permission prompts (dangerously-skip-permissions)
+  aide --docker [rancher|path]  Mount Docker socket (rancher = ~/.rd/docker.sock)
+  aide --kube <path>            Mount kubeconfig read-only; auto-detects local clusters
+  aide --config <path>          Load project config from path (default: $CWD/aide.yaml)
   aide -- <flags>           Pass extra flags to docker run
 
 Environment:
   AIDE_EXTRA_DOMAINS        Optional. Space-separated FQDNs to allow through firewall.
                             Also merged from firewall-domains.local.txt (gitignored) if present.
+
+Config files (auto-loaded from current directory):
+  aide.yaml             Project config (commit this)
+  aide.local.yaml       Per-engineer overrides (add to .gitignore)
+
+Config file schema:
+  docker: rancher             # or /path/to/docker.sock
+  kube: ~/.kube/config        # path to kubeconfig
+  extra_domains:              # appended to firewall allowlist
+    - registry.example.com
 EOF
 }
 
 die() {
   echo "aide: error: $*" >&2
   exit 1
+}
+
+# ── Config file parsing ───────────────────────────────────────────────────────
+
+# parse_aide_config <file> <output-var-prefix>
+# Reads aide.yaml subset into variables:
+#   <prefix>_docker, <prefix>_kube, <prefix>_extra_domains (space-separated)
+parse_aide_config() {
+  local file="$1"
+  local prefix="$2"
+  local in_domains=false
+  local docker_val="" kube_val="" domains_val=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip comments and blank lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+
+    if [[ "$line" =~ ^docker:[[:space:]]*(.+)$ ]]; then
+      docker_val="${BASH_REMATCH[1]}"
+      in_domains=false
+    elif [[ "$line" =~ ^kube:[[:space:]]*(.+)$ ]]; then
+      kube_val="${BASH_REMATCH[1]}"
+      # Expand ~ manually (bash won't expand in variable assignment)
+      kube_val="${kube_val/#\~/$HOME}"
+      in_domains=false
+    elif [[ "$line" =~ ^extra_domains:[[:space:]]*$ ]]; then
+      in_domains=true
+    elif [[ "$in_domains" == true && "$line" =~ ^[[:space:]]+-[[:space:]]*(.+)$ ]]; then
+      local domain="${BASH_REMATCH[1]}"
+      domains_val="${domains_val:+$domains_val }$domain"
+    else
+      in_domains=false
+    fi
+  done < "$file"
+
+  # Export into named variables using indirect assignment
+  printf -v "${prefix}_docker"       '%s' "$docker_val"
+  printf -v "${prefix}_kube"         '%s' "$kube_val"
+  printf -v "${prefix}_extra_domains" '%s' "$domains_val"
+}
+
+# load_project_config <override-config-path>
+# Populates CONF_DOCKER, CONF_KUBE, CONF_EXTRA_DOMAINS from aide.yaml + aide.local.yaml
+load_project_config() {
+  local config_override="${1:-}"
+  CONF_DOCKER="" CONF_KUBE="" CONF_EXTRA_DOMAINS=""
+
+  local base_file
+  if [[ -n "$config_override" ]]; then
+    [[ -f "$config_override" ]] || die "--config: file not found: $config_override"
+    base_file="$config_override"
+  else
+    base_file="$PWD/aide.yaml"
+  fi
+
+  if [[ -f "$base_file" ]]; then
+    parse_aide_config "$base_file" "_base"
+    CONF_DOCKER="$_base_docker"
+    CONF_KUBE="$_base_kube"
+    CONF_EXTRA_DOMAINS="$_base_extra_domains"
+  fi
+
+  # Local overrides (only when using auto-discovery, not --config)
+  local local_file="$PWD/aide.local.yaml"
+  if [[ -z "$config_override" && -f "$local_file" ]]; then
+    # Warn if aide.local.yaml is not gitignored
+    if [[ -f "$PWD/.gitignore" ]] && ! grep -qxF 'aide.local.yaml' "$PWD/.gitignore" 2>/dev/null; then
+      echo "aide: warning: aide.local.yaml found but not in .gitignore — consider adding it" >&2
+    fi
+    parse_aide_config "$local_file" "_local"
+    # Scalars: local wins
+    [[ -n "$_local_docker" ]] && CONF_DOCKER="$_local_docker"
+    [[ -n "$_local_kube"   ]] && CONF_KUBE="$_local_kube"
+    # Lists: append
+    CONF_EXTRA_DOMAINS="${CONF_EXTRA_DOMAINS:+$CONF_EXTRA_DOMAINS }${_local_extra_domains}"
+    CONF_EXTRA_DOMAINS="${CONF_EXTRA_DOMAINS## }"  # trim leading space
+  fi
+}
+
+# resolve_docker_socket <value>
+# Resolves docker preset names to socket paths and validates.
+resolve_docker_socket() {
+  local val="$1"
+  local sock
+  case "$val" in
+    rancher) sock="$HOME/.rd/docker.sock" ;;
+    *)       sock="$val" ;;
+  esac
+  sock="${sock/#\~/$HOME}"
+  if [[ ! -S "$sock" ]]; then
+    die "--docker: socket not found or not a socket: $sock"
+  fi
+  echo "$sock"
+}
+
+# extract_kube_server <kubeconfig-path>
+# Returns the server URL of the current-context cluster.
+extract_kube_server() {
+  local kube="$1"
+  python3 - "$kube" <<'EOF'
+import sys, re
+
+kube_path = sys.argv[1]
+with open(kube_path) as f:
+    content = f.read()
+
+# Find current-context
+ctx_match = re.search(r'^current-context:\s*(.+)$', content, re.MULTILINE)
+if not ctx_match:
+    sys.exit(0)
+ctx_name = ctx_match.group(1).strip()
+
+# Find the cluster name for this context
+in_ctx = False
+cluster_name = None
+for line in content.splitlines():
+    if re.match(r'\s*-\s*context:', line):
+        in_ctx = True
+        cluster_name = None
+    elif in_ctx and re.match(r'\s*cluster:\s*(.+)', line):
+        cluster_name = re.match(r'\s*cluster:\s*(.+)', line).group(1).strip()
+    elif in_ctx and re.match(r'\s*name:\s*(.+)', line):
+        name = re.match(r'\s*name:\s*(.+)', line).group(1).strip()
+        if name == ctx_name and cluster_name:
+            break
+        in_ctx = False
+
+if not cluster_name:
+    sys.exit(0)
+
+# Find server for that cluster
+in_cluster = False
+for line in content.splitlines():
+    if re.match(r'\s*-\s*cluster:', line):
+        in_cluster = True
+    elif in_cluster and re.match(r'\s*server:\s*(.+)', line):
+        print(re.match(r'\s*server:\s*(.+)', line).group(1).strip())
+        break
+    elif in_cluster and re.match(r'\s*name:\s*(.+)', line):
+        name = re.match(r'\s*name:\s*(.+)', line).group(1).strip()
+        if name == cluster_name:
+            continue
+        in_cluster = False
+EOF
+}
+
+# is_local_server <server-url>
+# Returns 0 (true) if the server URL points to localhost/127.0.0.1
+is_local_server() {
+  local url="$1"
+  [[ "$url" =~ ^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?(/.*)?$ ]]
+}
+
+# extract_port <server-url>
+# Extracts port from URL; defaults to 443 if not present.
+extract_port() {
+  local url="$1"
+  if [[ "$url" =~ :([0-9]+)(/|$) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "443"
+  fi
 }
 
 preflight() {
@@ -127,6 +303,46 @@ setup_docker_flags() {
     docker_flags+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
   fi
 
+  # Merge extra_domains from config into AIDE_EXTRA_DOMAINS
+  if [[ -n "${CONF_EXTRA_DOMAINS:-}" ]]; then
+    export AIDE_EXTRA_DOMAINS="${AIDE_EXTRA_DOMAINS:+$AIDE_EXTRA_DOMAINS }$CONF_EXTRA_DOMAINS"
+  fi
+
+  # Docker socket passthrough
+  # Priority: CLI --docker > aide.yaml docker > none
+  local docker_val="${DOCKER_SOCKET_ARG:-${CONF_DOCKER:-}}"
+  if [[ -n "$docker_val" ]]; then
+    local docker_sock
+    docker_sock=$(resolve_docker_socket "$docker_val")
+    docker_flags+=(
+      -v "$docker_sock:/var/run/docker.sock"
+      -e "DOCKER_HOST=unix:///var/run/docker.sock"
+    )
+    echo "aide: mounting Docker socket: $docker_sock"
+  fi
+
+  # Kubeconfig passthrough
+  # Priority: CLI --kube > aide.yaml kube > none
+  local kube_val="${KUBE_ARG:-${CONF_KUBE:-}}"
+  if [[ -n "$kube_val" ]]; then
+    kube_val="${kube_val/#\~/$HOME}"
+    [[ -f "$kube_val" ]] || die "--kube: file not found: $kube_val"
+    docker_flags+=(
+      -v "$kube_val:/home/aide/.kube/config:ro"
+      -e "KUBECONFIG=/home/aide/.kube/config"
+    )
+    echo "aide: mounting kubeconfig: $kube_val"
+
+    # Detect local cluster → pass port for DNAT
+    local server port
+    server=$(extract_kube_server "$kube_val")
+    if [[ -n "$server" ]] && is_local_server "$server"; then
+      port=$(extract_port "$server")
+      docker_flags+=(-e "AIDE_KUBE_LOCAL_PORT=$port")
+      echo "aide: local K8s cluster detected (port ${port}) — DNAT will be applied in container"
+    fi
+  fi
+
   # Merge firewall-domains.local (gitignored) into AIDE_EXTRA_DOMAINS
   local local_domains_file="$AIDE_ROOT/firewall-domains.local.txt"
   if [[ -f "$local_domains_file" ]]; then
@@ -175,9 +391,32 @@ cmd_run() {
   local noninteractive=false
   local caffeinate=false
   local dangerous=false
+  local shell_mode=false
+  local DOCKER_SOCKET_ARG=""
+  local KUBE_ARG=""
+  local CONFIG_ARG=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      shell)
+        shell_mode=true
+        shift
+        ;;
+      --docker)
+        if [[ -n "${2:-}" && "${2}" != --* ]]; then
+          DOCKER_SOCKET_ARG="$2"; shift 2
+        else
+          DOCKER_SOCKET_ARG="rancher"; shift
+        fi
+        ;;
+      --kube)
+        [[ -z "${2:-}" ]] && die "--kube requires a path argument"
+        KUBE_ARG="$2"; shift 2
+        ;;
+      --config)
+        [[ -z "${2:-}" ]] && die "--config requires a path argument"
+        CONFIG_ARG="$2"; shift 2
+        ;;
       -m)
         [[ -z "${2:-}" ]] && die "-m requires a path argument"
         local src
@@ -225,17 +464,26 @@ cmd_run() {
     esac
   done
 
+  # Done parsing args; load config (CLI --config or CWD auto-discovery)
+  load_project_config "${CONFIG_ARG:-}"
+
   local docker_flags=() git_name="" git_email=""
   setup_docker_flags
+
+  # workaround for bash to not expand arrays with empty values
+  docker_flags+=(${extra_mounts[@]+"${extra_mounts[@]}"})
+  docker_flags+=(${extra_docker_flags[@]+"${extra_docker_flags[@]}"})
+
+  if [[ "$shell_mode" == true ]]; then
+    docker_flags+=(-it)
+    docker run "${docker_flags[@]}" "$IMAGE_NAME" bash
+    return
+  fi
 
   # Interactive TTY unless non-interactive mode
   if [[ "$noninteractive" == false ]]; then
     docker_flags+=(-it)
   fi
-
-  # workaround for bash to not expand arrays with empty values
-  docker_flags+=(${extra_mounts[@]+"${extra_mounts[@]}"})
-  docker_flags+=(${extra_docker_flags[@]+"${extra_docker_flags[@]}"})
 
   # acceptEdits is default on; dangerous mode skips all permission prompts
   if [[ "$dangerous" == true ]]; then
@@ -257,6 +505,8 @@ cmd_run() {
 }
 
 cmd_shell() {
+  local DOCKER_SOCKET_ARG="" KUBE_ARG="" CONFIG_ARG=""
+  load_project_config ""
   local docker_flags=() git_name="" git_email=""
   setup_docker_flags
   docker_flags+=(-it)

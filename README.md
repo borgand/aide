@@ -220,6 +220,76 @@ skills-repo/my-skill/SKILL.md
 
 The `SKILL.md` file contains instructions that Claude Code will follow when the skill is active. Commit it to share with the team.
 
+## Docker & Kubernetes
+
+### Docker socket passthrough
+
+Allow the agent to build images, run containers, and interact with Docker:
+
+```bash
+aide --docker rancher           # Rancher Desktop rootless socket (~/.rd/docker.sock)
+aide --docker /path/to/sock     # Explicit socket path (any runtime)
+```
+
+Inside the container, `docker` CLI connects via `/var/run/docker.sock`. With Rancher Desktop's rootless socket the blast radius is contained to the Lima VM — the agent cannot access the host filesystem or processes. Mounting `/var/run/docker.sock` (system Docker) is effectively root-equivalent on the host; use it with that in mind.
+
+### Kubernetes: remote cluster
+
+Mount a kubeconfig read-only so `kubectl`, `helm`, and `kustomize` can reach a remote cluster:
+
+```bash
+aide --kube ~/.kube/config
+```
+
+The kubeconfig is mounted at `/home/aide/.kube/config` inside the container. You can pre-scope it to a service account with limited RBAC — the agent cannot exceed those permissions regardless of what it attempts.
+
+> **Kubernetes firewall:** aide does not automatically allowlist your Kubernetes API server.
+> Add the cluster hostname to `extra_domains` in `aide.yaml` or `firewall-domains.local.txt`.
+> This is intentional — firewall changes require explicit acknowledgement and should not happen
+> silently.
+
+### Kubernetes: local cluster (localhost API server)
+
+Rancher Desktop and similar tools expose K3s at `https://127.0.0.1:6443`. This address is the host's loopback — unreachable from inside a container.
+
+When aide detects that the kubeconfig's current-context server is `localhost` or `127.0.0.1`, it automatically passes `AIDE_KUBE_LOCAL_PORT` into the container. The firewall startup script adds an iptables DNAT rule that transparently forwards `127.0.0.1:PORT` → `host.docker.internal:PORT`. The kubeconfig is mounted unmodified — no rewriting required.
+
+No extra firewall configuration is needed for local K8s; `host.docker.internal` is already in the gateway subnet allowlist.
+
+### Project config: aide.yaml
+
+Commit an `aide.yaml` to your project repo to set defaults for everyone on the team:
+
+```yaml
+# aide.yaml
+docker: rancher                    # or /path/to/docker.sock
+kube: ~/.kube/contexts/myproject.yaml  # path to kubeconfig (~ expanded)
+extra_domains:                     # appended to firewall allowlist
+  - my-registry.example.com
+  - dev-cluster.internal.example.com
+```
+
+aide auto-loads `aide.yaml` from the current directory on every run.
+
+### Per-engineer overrides: aide.local.yaml
+
+Create `aide.local.yaml` alongside `aide.yaml` for machine-specific overrides (different kubeconfig path, local mirror domains, etc.). **Add it to `.gitignore`** — it is not committed.
+
+```yaml
+# aide.local.yaml  (gitignored)
+kube: ~/.kube/contexts/myproject-personal.yaml
+extra_domains:
+  - internal-mirror.lan
+```
+
+Scalar fields (`docker`, `kube`) in `aide.local.yaml` win over `aide.yaml`. `extra_domains` lists are **appended** (base + local).
+
+Use `--config <path>` to load a config from an explicit path, bypassing CWD auto-discovery (including `aide.local.yaml`):
+
+```bash
+aide --config /path/to/custom-aide.yaml
+```
+
 ## VS Code Devcontainer
 
 The repository includes a `devcontainer.json` for use with VS Code's Dev Containers extension. Open the aide repo in VS Code, choose "Reopen in Container", and you get the same isolated environment with zsh as the default terminal. The container receives `NET_ADMIN` and `NET_RAW` capabilities for the firewall, and runs as the `aide` user.

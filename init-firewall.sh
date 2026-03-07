@@ -96,6 +96,23 @@ if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then
   fi
 fi
 
+# ── Local Kubernetes cluster port forwarding ─────────────────────────────────
+# If the kubeconfig server is localhost, DNAT 127.0.0.1:PORT → host.docker.internal:PORT
+# so kubectl works without rewriting the kubeconfig.
+if [[ -n "${AIDE_KUBE_LOCAL_PORT:-}" ]]; then
+  echo "aide-firewall: enabling local K8s DNAT on port ${AIDE_KUBE_LOCAL_PORT}..."
+  sysctl -w net.ipv4.conf.all.route_localnet=1
+  HOST_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+  if [[ -z "$HOST_IP" ]]; then
+    echo "aide-firewall: WARNING — host.docker.internal not resolvable; local K8s DNAT skipped" >&2
+  else
+    iptables -t nat -A OUTPUT \
+      -d 127.0.0.1 -p tcp --dport "$AIDE_KUBE_LOCAL_PORT" \
+      -j DNAT --to-destination "$HOST_IP:$AIDE_KUBE_LOCAL_PORT"
+    echo "aide-firewall: local K8s DNAT active (127.0.0.1:${AIDE_KUBE_LOCAL_PORT} → ${HOST_IP}:${AIDE_KUBE_LOCAL_PORT})"
+  fi
+fi
+
 ipset create allowed-domains hash:net
 
 IP_REGEX='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
