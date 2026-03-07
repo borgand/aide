@@ -44,6 +44,23 @@ if [[ -n "${GIT_AUTHOR_NAME:-}" || -n "${GIT_AUTHOR_EMAIL:-}" ]]; then
   unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 fi
 
+# Persist ~/.ssh/known_hosts via the aide-claude volume so SSH host keys
+# survive container restarts (avoids repeated "authenticity of host" prompts).
+SSH_DIR=/home/aide/.ssh
+SSH_KNOWN_HOSTS_STORE=/home/aide/.claude/.ssh/known_hosts
+mkdir -p /home/aide/.claude/.ssh
+touch "$SSH_KNOWN_HOSTS_STORE"
+chmod 700 /home/aide/.claude/.ssh
+chmod 600 "$SSH_KNOWN_HOSTS_STORE"
+chown -R aide:aide /home/aide/.claude/.ssh
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+chown aide:aide "$SSH_DIR"
+# Symlink known_hosts → volume-backed copy
+rm -f "$SSH_DIR/known_hosts"
+ln -sf "$SSH_KNOWN_HOSTS_STORE" "$SSH_DIR/known_hosts"
+chown -h aide:aide "$SSH_DIR/known_hosts"
+
 # Set up SSH agent forwarding via TCP proxy (macOS host → container)
 if [[ -n "${SSH_AGENT_PROXY_PORT:-}" ]]; then
   socat UNIX-LISTEN:/tmp/ssh_agent.sock,fork,user=aide,group=aide,mode=600 \
