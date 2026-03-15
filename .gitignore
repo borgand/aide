@@ -12,3 +12,6 @@ certs/
 
 # mise lockfiles (generated on first build)
 mise/*.lock
+
+# Git worktrees
+.worktrees/
