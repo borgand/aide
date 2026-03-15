@@ -293,12 +293,6 @@ cmd_run() {
     -w /workspace
   )
 
-  # On macOS/Lima, override host.docker.internal to the Docker bridge gateway
-  # so in-container socat proxies can reach host-side socat listeners.
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    docker_flags+=(--add-host=host.docker.internal:host-gateway)
-  fi
-
   # Pass API key only if set
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] && docker_flags+=(-e ANTHROPIC_API_KEY)
 
@@ -322,14 +316,10 @@ cmd_run() {
   elif [[ "$(uname -s)" == "Darwin" ]]; then
     socat_bind_ip=$(python3 -c "import socket; print(socket.gethostbyname('host.docker.internal'))" 2>/dev/null || true)
     if [[ -n "$socat_bind_ip" ]] && ! ifconfig 2>/dev/null | grep -qF "inet ${socat_bind_ip}"; then
-      echo "aide: info: Lima SLIRP detected; falling back to docker bridge gateway" >&2
+      echo "aide: info: Lima SLIRP detected; binding socat to 127.0.0.1" >&2
       socat_bind_ip=""
     fi
-    if [[ -z "$socat_bind_ip" ]]; then
-      socat_bind_ip=$(docker network inspect bridge \
-        -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
-    fi
-    [[ -z "$socat_bind_ip" ]] && socat_bind_ip="172.17.0.1"
+    [[ -z "$socat_bind_ip" ]] && socat_bind_ip="127.0.0.1"
   else
     socat_bind_ip=$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
     if [[ -z "$socat_bind_ip" ]]; then
