@@ -106,6 +106,22 @@ else
   fail "aide user might have sudo access"
 fi
 
+# --- Test 12: kubectl binary exists ---
+kubectl_path=$(runit which kubectl 2>/dev/null || true)
+if [[ -n "$kubectl_path" ]]; then
+  ok "kubectl binary found at $kubectl_path"
+else
+  fail "kubectl binary not found"
+fi
+
+# --- Test 13: socat binary exists ---
+socat_path=$(runit which socat 2>/dev/null || true)
+if [[ -n "$socat_path" ]]; then
+  ok "socat binary found at $socat_path"
+else
+  fail "socat binary not found"
+fi
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
