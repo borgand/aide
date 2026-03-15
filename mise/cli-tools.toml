@@ -1,0 +1,7 @@
+[tools]
+kubectl = "latest"
+helm = "latest"
+kustomize = "latest"
+gh = "latest"
+glab = "latest"
+delta = "latest"

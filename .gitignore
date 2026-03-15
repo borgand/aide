@@ -1,0 +1,14 @@
+# Local overrides
+aide.local.yaml
+firewall-domains.local.txt
+
+# Claude Code state (per-user, not shared)
+.claude/
+.claude/**
+
+# CA certificates (may contain org-specific certs)
+certs/
+!certs/.gitkeep
+
+# mise lockfiles (generated on first build)
+mise/*.lock

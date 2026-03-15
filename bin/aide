@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# bin/aide — CLI launcher for aide (Claude Code in a secured Docker container).
+set -euo pipefail
+
+# ======================================================================
+# Resolve AIDE_ROOT (follow symlinks so ~/bin/aide → repo/bin/aide works)
+# ======================================================================
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+AIDE_ROOT=$(cd -P "$(dirname "$SOURCE")/.." && pwd)
+
+IMAGE_NAME="aide:latest"
+
+# ======================================================================
+# Helper functions
+# ======================================================================
+
+usage() {
+  cat <<'EOF'
+Usage: aide [subcommand] [options] [-- docker-args...]
+
+Subcommands:
+  build         Rebuild the Docker image
+  pull          git pull --ff-only then rebuild
+  shell         Interactive bash shell (same mounts as run)
+
+Options:
+  -p "prompt"               Non-interactive mode
+  -m <path>                 Mount <path> read-only at /extra/<basename>
+  -mw <path>                Mount <path> read-write at /extra/<basename>
+  -c, --caffeinate          macOS: prevent sleep during session
+  -d, --dangerous           Skip permission prompts
+  --docker [rancher|path]   Mount Docker socket
+  --kube <path>             Mount kubeconfig; proxy local clusters
+  --host-ip <ip>            Override host IP for socat binding
+  --lan-host <host[:port]>  Proxy a LAN host (default port 443)
+  --config <path>           Load project config from explicit path
+  --                        Pass remaining args to docker run
+  -h, --help                Show this help
+EOF
+  exit 0
+}
+
+die()  { echo "aide: error: $*" >&2; exit 1; }
+warn() { echo "aide: warning: $*" >&2; }
+
+# ======================================================================
+# Config parsing (pure Bash subset YAML)
+# ======================================================================
+
+parse_aide_config() {
+  local file="$1" prefix="$2"
+  local in_list="" docker_val="" kube_val="" host_ip_val="" domains_val="" lan_hosts_val=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+
+    if [[ "$line" =~ ^docker:[[:space:]]*(.+)$ ]]; then
+      docker_val="${BASH_REMATCH[1]}"; in_list=""
+    elif [[ "$line" =~ ^kube:[[:space:]]*(.+)$ ]]; then
+      kube_val="${BASH_REMATCH[1]/#\~/$HOME}"; in_list=""
+    elif [[ "$line" =~ ^host_ip:[[:space:]]*(.+)$ ]]; then
+      host_ip_val="${BASH_REMATCH[1]}"; in_list=""
+    elif [[ "$line" =~ ^extra_domains:[[:space:]]*$ ]]; then
+      in_list="domains"
+    elif [[ "$line" =~ ^lan_hosts:[[:space:]]*$ ]]; then
+      in_list="lan_hosts"
+    elif [[ -n "$in_list" && "$line" =~ ^[[:space:]]+-[[:space:]]*(.+)$ ]]; then
+      local item="${BASH_REMATCH[1]}"
+      [[ "$in_list" == "domains"   ]] && domains_val="${domains_val:+$domains_val }$item"
+      [[ "$in_list" == "lan_hosts" ]] && lan_hosts_val="${lan_hosts_val:+$lan_hosts_val }$item"
+    else
+      in_list=""
+    fi
+  done < "$file"
+
+  printf -v "${prefix}_docker"        '%s' "$docker_val"
+  printf -v "${prefix}_kube"          '%s' "$kube_val"
+  printf -v "${prefix}_host_ip"       '%s' "$host_ip_val"
+  printf -v "${prefix}_extra_domains" '%s' "$domains_val"
+  printf -v "${prefix}_lan_hosts"     '%s' "$lan_hosts_val"
+}
+
+load_project_config() {
+  local config_path="${1:-}"
+  CONF_docker="" CONF_kube="" CONF_host_ip="" CONF_extra_domains="" CONF_lan_hosts=""
+
+  if [[ -n "$config_path" ]]; then
+    [[ -f "$config_path" ]] || die "config file not found: $config_path"
+    parse_aide_config "$config_path" "CONF"
+    return
+  fi
+
+  # Auto-discover aide.yaml from $PWD
+  if [[ -f "$PWD/aide.yaml" ]]; then
+    parse_aide_config "$PWD/aide.yaml" "CONF"
+  fi
+
+  # Overlay aide.local.yaml
+  if [[ -f "$PWD/aide.local.yaml" ]]; then
+    # Warn if not gitignored
+    if [[ -f "$PWD/.gitignore" ]] && ! grep -qF 'aide.local.yaml' "$PWD/.gitignore" 2>/dev/null; then
+      echo "aide: warning: aide.local.yaml exists but is not in .gitignore" >&2
+    fi
+    local _local_docker="" _local_kube="" _local_host_ip="" _local_extra_domains="" _local_lan_hosts=""
+    parse_aide_config "$PWD/aide.local.yaml" "_local"
+    # Scalars: local overrides base
+    [[ -n "$_local_docker"  ]] && CONF_docker="$_local_docker"
+    [[ -n "$_local_kube"    ]] && CONF_kube="$_local_kube"
+    [[ -n "$_local_host_ip" ]] && CONF_host_ip="$_local_host_ip"
+    # Lists: append
+    CONF_extra_domains="${CONF_extra_domains:+$CONF_extra_domains }$_local_extra_domains"
+    CONF_lan_hosts="${CONF_lan_hosts:+$CONF_lan_hosts }$_local_lan_hosts"
+  fi
+}
+
+resolve_docker_socket() {
+  local val="$1"
+  case "$val" in
+    rancher)
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "/var/run/docker.sock"
+        return
+      fi
+      echo "$HOME/.rd/docker.sock"
+      ;;
+    *) echo "$val" ;;
+  esac
+}
+
+extract_kube_server() {
+  kubectl config view --minify --kubeconfig="$1" -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
+}
+
+is_local_server() {
+  local server="$1"
+  [[ "$server" =~ ^https?://(127\.0\.0\.1|localhost)(:|/) ]]
+}
+
+extract_port() {
+  local server="$1"
+  if [[ "$server" =~ :([0-9]+)/?$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "443"
+  fi
+}
+
+preflight() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed or not in PATH"
+  docker info >/dev/null 2>&1 || die "Docker is not running"
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    local claude_json="$HOME/.claude.json"
+    if [[ ! -f "$claude_json" ]] || ! grep -q '"sessionToken"\|"oauthToken"\|"accessToken"' "$claude_json" 2>/dev/null; then
+      warn "ANTHROPIC_API_KEY is not set and no Claude session token found. Run 'claude login' inside the container."
+    fi
+  fi
+}
+
+image_exists() {
+  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1
+}
+
+# ======================================================================
+# Cleanup trap
+# ======================================================================
+
+SSH_PROXY_PID=""
+kube_proxy_pid=""
+tmp_kube_dir=""
+lan_proxy_pids=()
+
+cleanup() {
+  [[ -n "${SSH_PROXY_PID:-}"  ]] && kill "$SSH_PROXY_PID"  2>/dev/null || true
+  [[ -n "${kube_proxy_pid:-}" ]] && kill "$kube_proxy_pid" 2>/dev/null || true
+  [[ -n "${tmp_kube_dir:-}"   ]] && rm -rf "$tmp_kube_dir"              || true
+  for _pid in "${lan_proxy_pids[@]+"${lan_proxy_pids[@]}"}"; do
+    kill "$_pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+
+# ======================================================================
+# Subcommands
+# ======================================================================
+
+cmd_build() {
+  local build_args=()
+  # Auto-inject CA cert if present
+  for f in "$AIDE_ROOT"/certs/*.crt "$AIDE_ROOT"/certs/*.pem "$AIDE_ROOT"/certs/*.cer; do
+    [[ -f "$f" ]] && {
+      build_args+=(--build-arg "EXTRA_CA_CERT_B64=$(base64 < "$f" | tr -d '\n')")
+      break
+    }
+  done
+  # AIDE_CA_CERT_FILE env var takes precedence
+  [[ -n "${AIDE_CA_CERT_FILE:-}" ]] && \
+    build_args+=(--build-arg "EXTRA_CA_CERT_B64=$(base64 < "$AIDE_CA_CERT_FILE" | tr -d '\n')")
+
+  docker build -t "$IMAGE_NAME" "${build_args[@]+"${build_args[@]}"}" "$AIDE_ROOT"
+}
+
+cmd_pull() {
+  cd "$AIDE_ROOT"
+  git pull --ff-only
+  cmd_build
+}
+
+cmd_run() {
+  local shell_mode=false
+  local prompt=""
+  local caffeinate=false
+  local dangerous=false
+  local docker_val=""
+  local kube_val=""
+  local host_ip_val=""
+  local config_path=""
+  local -a extra_mounts=()
+  local -a extra_lan_hosts=()
+  local -a passthrough_args=()
+
+  # Parse CLI flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      shell)     shell_mode=true; shift ;;
+      -p)        prompt="$2"; shift 2 ;;
+      -m)        extra_mounts+=("-v" "$2:/extra/$(basename "$2"):ro"); shift 2 ;;
+      -mw)       extra_mounts+=("-v" "$2:/extra/$(basename "$2")"); shift 2 ;;
+      -c|--caffeinate)  caffeinate=true; shift ;;
+      -d|--dangerous)   dangerous=true; shift ;;
+      --docker)
+        if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+          docker_val="$2"; shift 2
+        else
+          docker_val="rancher"; shift
+        fi
+        ;;
+      --kube)    kube_val="$2"; shift 2 ;;
+      --host-ip) host_ip_val="$2"; shift 2 ;;
+      --lan-host) extra_lan_hosts+=("$2"); shift 2 ;;
+      --config)  config_path="$2"; shift 2 ;;
+      --)        shift; passthrough_args=("$@"); break ;;
+      -h|--help) usage ;;
+      *)         die "unknown option: $1" ;;
+    esac
+  done
+
+  preflight
+
+  # Build image if it doesn't exist
+  if ! image_exists; then
+    echo "aide: image not found, building first..."
+    cmd_build
+  fi
+
+  # Load project config
+  load_project_config "$config_path"
+
+  # Apply precedence: CLI > local > yaml > env > default
+  [[ -z "$docker_val"  ]] && docker_val="$CONF_docker"
+  [[ -z "$kube_val"    ]] && kube_val="$CONF_kube"
+  [[ -z "$host_ip_val" ]] && host_ip_val="$CONF_host_ip"
+
+  # Merge extra domains from all sources
+  local all_extra_domains="$CONF_extra_domains"
+  # firewall-domains.local.txt
+  if [[ -f "$AIDE_ROOT/firewall-domains.local.txt" ]]; then
+    local file_domains
+    file_domains=$(grep -v '^\s*#' "$AIDE_ROOT/firewall-domains.local.txt" 2>/dev/null | tr '\n' ' ' | xargs || true)
+    all_extra_domains="${all_extra_domains:+$all_extra_domains }$file_domains"
+  fi
+  # AIDE_EXTRA_DOMAINS env var
+  all_extra_domains="${all_extra_domains:+$all_extra_domains }${AIDE_EXTRA_DOMAINS:-}"
+
+  # Merge LAN hosts from config + CLI
+  local all_lan_hosts="$CONF_lan_hosts"
+  for lh in "${extra_lan_hosts[@]+"${extra_lan_hosts[@]}"}"; do
+    all_lan_hosts="${all_lan_hosts:+$all_lan_hosts }$lh"
+  done
+
+  # Ensure .claude directory exists
+  mkdir -p "$AIDE_ROOT/.claude"
+
+  # --- Core docker flags ---
+  local -a docker_flags=(
+    --rm --init
+    --cap-add=NET_ADMIN --cap-add=NET_RAW
+    -v "$PWD:/workspace"
+    -v "$AIDE_ROOT/.claude:/home/aide/.claude"
+    -e "ANTHROPIC_BASE_URL=https://api.anthropic.com"
+    -e "AIDE_PROJECT_NAME=$(basename "$PWD")"
+    -w /workspace
+  )
+
+  # Pass API key only if set
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && docker_flags+=(-e ANTHROPIC_API_KEY)
+
+  # TTY allocation
+  if [[ -z "$prompt" && -t 0 ]]; then
+    docker_flags+=(-it)
+  fi
+
+  # Extra domains
+  if [[ -n "$all_extra_domains" ]]; then
+    docker_flags+=(-e "AIDE_EXTRA_DOMAINS=$all_extra_domains")
+  fi
+
+  # Extra mounts
+  docker_flags+=("${extra_mounts[@]+"${extra_mounts[@]}"}")
+
+  # --- Host IP detection ---
+  local socat_bind_ip=""
+  if [[ -n "$host_ip_val" ]]; then
+    socat_bind_ip="$host_ip_val"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    socat_bind_ip=$(python3 -c "import socket; print(socket.gethostbyname('host.docker.internal'))" 2>/dev/null || true)
+    if [[ -n "$socat_bind_ip" ]] && ! ifconfig 2>/dev/null | grep -qF "inet ${socat_bind_ip}"; then
+      echo "aide: info: Lima SLIRP detected; binding socat to 127.0.0.1" >&2
+      socat_bind_ip=""
+    fi
+    [[ -z "$socat_bind_ip" ]] && socat_bind_ip="127.0.0.1"
+  else
+    socat_bind_ip=$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+    if [[ -z "$socat_bind_ip" ]]; then
+      socat_bind_ip=$(ip -4 addr show docker0 2>/dev/null | grep -oP 'inet \K[\d.]+' || true)
+    fi
+    [[ -z "$socat_bind_ip" ]] && socat_bind_ip="172.17.0.1"
+  fi
+
+  # --- Git identity forwarding ---
+  local git_name git_email
+  git_name=$(git config --global user.name 2>/dev/null || true)
+  git_email=$(git config --global user.email 2>/dev/null || true)
+  [[ -n "$git_name"  ]] && docker_flags+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+  [[ -n "$git_email" ]] && docker_flags+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
+
+  # --- SSH agent forwarding ---
+  if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      # macOS: socat TCP bridge (virtiofs can't do Unix sockets)
+      if command -v socat >/dev/null 2>&1; then
+        local ssh_proxy_port
+        ssh_proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+        socat "TCP-LISTEN:${ssh_proxy_port},bind=${socat_bind_ip},reuseaddr,fork" \
+          "UNIX-CONNECT:${SSH_AUTH_SOCK}" &
+        SSH_PROXY_PID=$!
+        docker_flags+=(-e "SSH_AGENT_PROXY_PORT=$ssh_proxy_port")
+      else
+        echo "aide: warning: socat not installed; SSH agent forwarding disabled" >&2
+      fi
+    else
+      # Linux: direct socket bind mount
+      docker_flags+=(-v "$SSH_AUTH_SOCK:/tmp/ssh_agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh_agent.sock")
+    fi
+  fi
+
+  # --- Docker socket ---
+  if [[ -n "$docker_val" ]]; then
+    local docker_sock
+    docker_sock=$(resolve_docker_socket "$docker_val")
+    [[ -S "$docker_sock" ]] || die "Docker socket not found: $docker_sock"
+    docker_flags+=(-v "$docker_sock:/var/run/docker.sock")
+  fi
+
+  # --- Kubeconfig ---
+  if [[ -n "$kube_val" ]]; then
+    [[ -f "$kube_val" ]] || die "kubeconfig not found: $kube_val"
+    tmp_kube_dir=$(mktemp -d)
+    local server
+    server=$(extract_kube_server "$kube_val")
+    if is_local_server "$server"; then
+      if command -v socat >/dev/null 2>&1; then
+        local kube_port proxy_port
+        kube_port=$(extract_port "$server")
+        proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+        sed -E "s,https://(127\.0\.0\.1|localhost):[0-9]+,https://127.0.0.1:${proxy_port},g" \
+          "$kube_val" > "$tmp_kube_dir/config"
+        socat "TCP-LISTEN:${proxy_port},bind=${socat_bind_ip},reuseaddr,fork" \
+          "TCP:127.0.0.1:${kube_port}" &
+        kube_proxy_pid=$!
+        sleep 0.2
+        if kill -0 "$kube_proxy_pid" 2>/dev/null; then
+          docker_flags+=(-e "AIDE_KUBE_LOCAL_PORT=$proxy_port")
+        else
+          echo "aide: warning: kube proxy failed to start" >&2
+          cp "$kube_val" "$tmp_kube_dir/config"
+        fi
+      else
+        echo "aide: warning: socat not installed; local kube cluster may not be accessible" >&2
+        cp "$kube_val" "$tmp_kube_dir/config"
+      fi
+    else
+      cp "$kube_val" "$tmp_kube_dir/config"
+    fi
+    chmod 600 "$tmp_kube_dir/config"
+    docker_flags+=(-v "$tmp_kube_dir:/home/aide/.kube:ro" -e "KUBECONFIG=/home/aide/.kube/config")
+  fi
+
+  # --- LAN host proxies ---
+  if [[ -n "$all_lan_hosts" ]]; then
+    local lan_proxy_specs=""
+    for host_spec in $all_lan_hosts; do
+      local lan_domain lan_port
+      if [[ "$host_spec" == *:* ]]; then
+        lan_domain="${host_spec%%:*}"
+        lan_port="${host_spec##*:}"
+      else
+        lan_domain="$host_spec"
+        lan_port="443"
+      fi
+      if command -v socat >/dev/null 2>&1; then
+        local lan_ip proxy_port
+        lan_ip=$(python3 -c "import socket; print(socket.gethostbyname('$lan_domain'))" 2>/dev/null || true)
+        if [[ -z "$lan_ip" ]]; then
+          echo "aide: warning: cannot resolve $lan_domain; skipping" >&2
+          continue
+        fi
+        proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+        socat "TCP-LISTEN:${proxy_port},bind=${socat_bind_ip},reuseaddr,fork" \
+          "TCP:${lan_ip}:${lan_port}" &
+        lan_proxy_pids+=($!)
+        lan_proxy_specs="${lan_proxy_specs:+$lan_proxy_specs }${lan_domain}:${lan_port}:${proxy_port}"
+      else
+        echo "aide: warning: socat not installed; LAN host proxy disabled" >&2
+      fi
+    done
+    if [[ -n "$lan_proxy_specs" ]]; then
+      docker_flags+=(-e "AIDE_LAN_PROXIES=$lan_proxy_specs")
+    fi
+  fi
+
+  # --- Passthrough docker args ---
+  docker_flags+=("${passthrough_args[@]+"${passthrough_args[@]}"}")
+
+  # --- Build Claude args ---
+  local -a claude_args=()
+  if [[ "$shell_mode" == true ]]; then
+    claude_args=(bash)
+  elif [[ -n "$prompt" ]]; then
+    claude_args=(claude --permission-mode acceptEdits -p "$prompt")
+  elif [[ "$dangerous" == true ]]; then
+    claude_args=(claude --dangerously-skip-permissions)
+  else
+    claude_args=(claude --permission-mode acceptEdits)
+  fi
+
+  # --- Startup plan ---
+  echo "aide: starting with:"
+  printf "  %-20s %s\n" "docker" "${docker_val:-off}"
+  printf "  %-20s %s\n" "kube" "${kube_val:-off}"
+  printf "  %-20s %s\n" "lan-hosts" "${all_lan_hosts:-none}"
+  printf "  %-20s %s\n" "extra-domains" "${all_extra_domains:-none}"
+  printf "  %-20s %s\n" "permissions" "$(if [[ "$dangerous" == true ]]; then echo 'dangerous'; elif [[ -n "$prompt" ]]; then echo 'acceptEdits (non-interactive)'; else echo 'acceptEdits'; fi)"
+  printf "  %-20s %s\n" "caffeinate" "$caffeinate"
+
+  # --- Launch ---
+  local -a run_cmd=(docker run "${docker_flags[@]}" "$IMAGE_NAME" "${claude_args[@]}")
+
+  if [[ "$caffeinate" == true && "$(uname -s)" == "Darwin" ]]; then
+    exec caffeinate -i "${run_cmd[@]}"
+  else
+    exec "${run_cmd[@]}"
+  fi
+}
+
+# ======================================================================
+# Main
+# ======================================================================
+
+case "${1:-}" in
+  build)  shift; cmd_build "$@" ;;
+  pull)   shift; cmd_pull "$@" ;;
+  -h|--help) usage ;;
+  *)      cmd_run "$@" ;;
+esac

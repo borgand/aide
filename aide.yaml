@@ -1,0 +1,21 @@
+# aide project configuration
+# Copy this to your project root and customize.
+# See PRDs/05-configuration.md for full schema.
+
+# Docker socket passthrough: "rancher" or absolute path
+# docker: rancher
+
+# Kubeconfig path (~ expanded to $HOME)
+# kube: ~/.kube/config
+
+# Override host IP for socat proxy binding
+# host_ip: 192.168.64.1
+
+# Extra domains to add to the firewall allowlist
+# extra_domains:
+#   - registry.example.com
+
+# LAN hosts to proxy through the Docker bridge
+# lan_hosts:
+#   - harvester.local
+#   - myhost.local:8080
