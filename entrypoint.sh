@@ -45,12 +45,12 @@ gosu aide mkdir -p /home/aide/.claude
 STATUSLINE='{"statusLine":{"type":"command","command":"/usr/local/bin/aide-statusline"}}'
 
 if [[ -s "$USER_SETTINGS" ]]; then
-  jq -s --argjson sl "$STATUSLINE" '
+  _merged=$(jq -s --argjson sl "$STATUSLINE" '
     .[0] as $user | .[1] as $policy
     | .[0] * .[1] * $sl
     | .permissions.allow = ((($user.permissions.allow // []) + ($policy.permissions.allow // [])) | unique)
-  ' "$USER_SETTINGS" "$POLICY" \
-    | gosu aide tee "$USER_SETTINGS" > /dev/null
+  ' "$USER_SETTINGS" "$POLICY")
+  echo "$_merged" | gosu aide tee "$USER_SETTINGS" > /dev/null
 else
   jq -n --slurpfile policy "$POLICY" --argjson sl "$STATUSLINE" \
     '$policy[0] * $sl' \
@@ -61,8 +61,8 @@ fi
 # Step 5: MCP merge (image defaults + user servers)
 # ======================================================================
 if [[ -s "$MCP_USER" ]]; then
-  jq -s '.[0] * .[1]' "$MCP_DEFAULTS" "$MCP_USER" \
-    | gosu aide tee "$MCP_USER" > /dev/null
+  _mcp_merged=$(jq -s '.[0] * .[1]' "$MCP_DEFAULTS" "$MCP_USER")
+  echo "$_mcp_merged" | gosu aide tee "$MCP_USER" > /dev/null
 else
   gosu aide cp "$MCP_DEFAULTS" "$MCP_USER"
 fi
@@ -134,6 +134,7 @@ if [[ -S /var/run/docker.sock ]]; then
     getent group "$docker_sock_gid" >/dev/null 2>&1 \
       || groupadd --gid "$docker_sock_gid" docker_aide 2>/dev/null || true
     usermod -aG "$docker_sock_gid" aide 2>/dev/null || true
+    chmod g+rw /var/run/docker.sock 2>/dev/null || true
   fi
 fi
 

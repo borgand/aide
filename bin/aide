@@ -123,10 +123,6 @@ resolve_docker_socket() {
   local val="$1"
   case "$val" in
     rancher)
-      if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "/var/run/docker.sock"
-        return
-      fi
       echo "$HOME/.rd/docker.sock"
       ;;
     *) echo "$val" ;;
@@ -361,10 +357,18 @@ cmd_run() {
 
   # --- Docker socket ---
   if [[ -n "$docker_val" ]]; then
-    local docker_sock
+    local docker_sock docker_sock_mount
     docker_sock=$(resolve_docker_socket "$docker_val")
     [[ -S "$docker_sock" ]] || die "Docker socket not found: $docker_sock"
-    docker_flags+=(-v "$docker_sock:/var/run/docker.sock")
+    # On macOS, ~/.rd/docker.sock is a macOS-side socket that can't be
+    # bind-mounted; Docker/Rancher Desktop exposes it inside containers
+    # at the standard /var/run/docker.sock path via the Lima VM bridge.
+    if [[ "$docker_sock" == *"/.rd/docker.sock" && "$(uname -s)" == "Darwin" ]]; then
+      docker_sock_mount="/var/run/docker.sock"
+    else
+      docker_sock_mount="$docker_sock"
+    fi
+    docker_flags+=(-v "$docker_sock_mount:/var/run/docker.sock")
   fi
 
   # --- Kubeconfig ---

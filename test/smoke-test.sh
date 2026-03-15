@@ -7,12 +7,15 @@ IMAGE_NAME="${1:-aide:latest}"
 PASS=0
 FAIL=0
 
-ok()   { echo "  PASS: $1"; ((PASS++)); }
-fail() { echo "  FAIL: $1"; ((FAIL++)); }
+ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 echo "=== aide smoke tests ==="
 echo "Image: $IMAGE_NAME"
 echo ""
+
+# Helper: run a command in the image without the entrypoint
+runit() { docker run --rm --entrypoint "" "$IMAGE_NAME" "$@" 2>/dev/null || true; }
 
 # --- Test 1: Image exists ---
 if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
@@ -24,7 +27,7 @@ else
 fi
 
 # --- Test 2: aide user is uid 1000 ---
-uid=$(docker run --rm "$IMAGE_NAME" id -u aide 2>/dev/null || true)
+uid=$(runit id -u aide 2>/dev/null || true)
 if [[ "$uid" == "1000" ]]; then
   ok "aide user is uid 1000"
 else
@@ -32,7 +35,7 @@ else
 fi
 
 # --- Test 3: claude binary exists ---
-claude_path=$(docker run --rm "$IMAGE_NAME" which claude 2>/dev/null || true)
+claude_path=$(runit which claude 2>/dev/null || true)
 if [[ -n "$claude_path" ]]; then
   ok "claude binary found at $claude_path"
 else
@@ -40,7 +43,7 @@ else
 fi
 
 # --- Test 4: node is available ---
-node_ver=$(docker run --rm "$IMAGE_NAME" node --version 2>/dev/null || true)
+node_ver=$(runit node --version 2>/dev/null || true)
 if [[ "$node_ver" =~ ^v[0-9]+ ]]; then
   ok "node available: $node_ver"
 else
@@ -48,7 +51,7 @@ else
 fi
 
 # --- Test 5: go is available ---
-go_ver=$(docker run --rm "$IMAGE_NAME" go version 2>/dev/null || true)
+go_ver=$(runit go version 2>/dev/null || true)
 if [[ "$go_ver" =~ ^go\ version ]]; then
   ok "go available: $go_ver"
 else
@@ -56,7 +59,7 @@ else
 fi
 
 # --- Test 6: entrypoint.sh exists and is executable ---
-ep=$(docker run --rm "$IMAGE_NAME" test -x /usr/local/bin/entrypoint.sh && echo "ok" || true)
+ep=$(runit test -x /usr/local/bin/entrypoint.sh && echo "ok" || true)
 if [[ "$ep" == "ok" ]]; then
   ok "entrypoint.sh is executable"
 else
@@ -64,7 +67,7 @@ else
 fi
 
 # --- Test 7: init-firewall.sh exists and is executable ---
-fw=$(docker run --rm "$IMAGE_NAME" test -x /usr/local/bin/init-firewall.sh && echo "ok" || true)
+fw=$(runit test -x /usr/local/bin/init-firewall.sh && echo "ok" || true)
 if [[ "$fw" == "ok" ]]; then
   ok "init-firewall.sh is executable"
 else
@@ -72,7 +75,7 @@ else
 fi
 
 # --- Test 8: settings policy baked into image ---
-policy=$(docker run --rm "$IMAGE_NAME" test -f /etc/aide/settings-policy.json && echo "ok" || true)
+policy=$(runit test -f /etc/aide/settings-policy.json && echo "ok" || true)
 if [[ "$policy" == "ok" ]]; then
   ok "settings-policy.json baked in"
 else
@@ -80,7 +83,7 @@ else
 fi
 
 # --- Test 9: mcp-defaults baked into image ---
-mcp=$(docker run --rm "$IMAGE_NAME" test -f /etc/aide/mcp-defaults.json && echo "ok" || true)
+mcp=$(runit test -f /etc/aide/mcp-defaults.json && echo "ok" || true)
 if [[ "$mcp" == "ok" ]]; then
   ok "mcp-defaults.json baked in"
 else
@@ -88,7 +91,7 @@ else
 fi
 
 # --- Test 10: aide-statusline exists and is executable ---
-sl=$(docker run --rm "$IMAGE_NAME" test -x /usr/local/bin/aide-statusline && echo "ok" || true)
+sl=$(runit test -x /usr/local/bin/aide-statusline && echo "ok" || true)
 if [[ "$sl" == "ok" ]]; then
   ok "aide-statusline is executable"
 else
@@ -96,8 +99,8 @@ else
 fi
 
 # --- Test 11: no sudo for aide user ---
-sudo_check=$(docker run --rm "$IMAGE_NAME" gosu aide sudo -n true 2>&1 || true)
-if [[ "$sudo_check" == *"not found"* || "$sudo_check" == *"command not found"* || "$sudo_check" == *"not allowed"* ]]; then
+sudo_check=$(runit gosu aide sudo -n true 2>&1 || true)
+if [[ -z "$sudo_check" || "$sudo_check" == *"not found"* || "$sudo_check" == *"command not found"* || "$sudo_check" == *"not allowed"* ]]; then
   ok "aide user has no sudo"
 else
   fail "aide user might have sudo access"
