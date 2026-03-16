@@ -7,8 +7,8 @@ firewall-domains.local.txt
 .claude/**
 
 # CA certificates (may contain org-specific certs)
-certs/
 !certs/.gitkeep
+certs/
 
 # mise lockfiles (generated on first build)
 mise/*.lock

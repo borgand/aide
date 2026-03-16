@@ -60,7 +60,6 @@ ln -s ~/aide/bin/aide ~/bin/aide   # or anywhere on your PATH
 ### First run
 
 - If using Claude Subscription, just run `aide` and follow the setup wizard to log in.
-
 - If using API Key:
 
 ```bash
@@ -164,7 +163,7 @@ lan_hosts:
 
 Personal/local overrides to project configuration.
 Scalar values (docker, kube, host_ip) replace the base; list values (extra_domains, lan_hosts) are appended.
-Keep this in `.gitignore`. 
+Keep this in `.gitignore`.
 
 ### Precedence
 
@@ -238,10 +237,31 @@ User settings from `.claude/settings.json` are merged with the policy — allow 
 
 ### CA certificates
 
-Corporate CA certificates can be injected at build time:
+Corporate or self-signed CA certificates can be injected at build time so that tools running inside the container (curl, git, Node.js, Go, etc.) trust your internal PKI.
 
-- Place `.crt`, `.pem`, or `.cer` files in the `certs/` directory, or
-- Set `AIDE_CA_CERT_FILE` to the path of a certificate before running `aide build`.
+**Option 1 — drop files into `certs/`**
+
+Place one or more `.crt`, `.pem`, or `.cer` files in the `certs/` directory before building:
+
+```
+certs/
+└── my-corp-ca.crt
+```
+
+All files in `certs/` are copied into the image and registered with `update-ca-certificates`. Node.js is additionally pointed at the system bundle via `NODE_EXTRA_CA_CERTS`.
+
+**Option 2 — `AIDE_CA_CERT_FILE` environment variable**
+
+If you prefer not to keep the certificate in the repo, set `AIDE_CA_CERT_FILE` to its path before building:
+
+```bash
+export AIDE_CA_CERT_FILE=/path/to/my-corp-ca.crt
+aide build
+```
+
+`AIDE_CA_CERT_FILE` takes precedence over any file in `certs/`. The certificate is passed to Docker as a base64-encoded build argument and is not stored outside the image.
+
+> **Note:** `certs/` is listed in `.gitignore` (only the placeholder `certs/.gitkeep` is tracked) so certificates are never accidentally committed.
 
 ---
 
