@@ -1,7 +1,6 @@
 [tools]
-kubectl = "latest"
-helm = "latest"
-kustomize = "latest"
-gh = "latest"
-glab = "latest"
-delta = "latest"
+kubectl   = "1.32.3"
+helm      = "3.17.2"
+kustomize = "5.6.0"
+glab      = "1.52.0"
+delta     = "0.18.2"

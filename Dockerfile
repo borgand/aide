@@ -58,7 +58,8 @@ FROM base AS mise-cli-tools
 RUN curl -fsSL https://mise.jdx.dev/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 COPY mise/cli-tools.toml /tmp/mise/.mise.toml
-RUN cd /tmp/mise && mise install --yes
+COPY mise/cli-tools.lock /tmp/mise/mise.lock
+RUN cd /tmp/mise && mise trust && mise install --locked
 
 FROM base AS mise-apps
 RUN curl -fsSL https://mise.jdx.dev/install.sh | sh
@@ -86,13 +87,26 @@ RUN node_dir=$(find /usr/local/lib/node/ -maxdepth 1 -mindepth 1 \
     && ln -sf "$node_dir" /usr/local/lib/node/current \
     && find /usr/local/go/ -name "go" -type f \
          -exec ln -sf {} /usr/local/bin/go \; \
-    && for tool in kubectl helm kustomize gh glab delta; do \
+    && for tool in kubectl helm kustomize glab delta; do \
          find /usr/local/share/mise-tools/ -name "$tool" -type f \
            -exec ln -sf {} /usr/local/bin/"$tool" \; ; \
        done \
     && find /usr/local/share/mise-apps/ -name "claude" \( -type f -o -type l \) \
          -exec ln -sf {} /usr/local/bin/claude \; \
     && chmod +x /usr/local/bin/claude 2>/dev/null || true
+
+# --- GitHub CLI (direct download; bypasses mise/aqua attestation check blocked by corporate firewalls) ---
+ARG GH_VERSION=2.68.1
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" \
+         -o /tmp/gh.tar.gz \
+    && case "$ARCH" in \
+         arm64) echo "018461fc2d55e88ff4e65d34251a8e3742629f44564a9734512276c080316f8f  /tmp/gh.tar.gz" | sha256sum -c - ;; \
+         amd64) echo "b4f533bf21d1fc0750976b4755e479ae3f59bfc42c9c22dfb0c0c5491ab1e152  /tmp/gh.tar.gz" | sha256sum -c - ;; \
+       esac \
+    && tar -xz -f /tmp/gh.tar.gz -C /tmp \
+    && mv /tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz /tmp/gh_${GH_VERSION}_linux_${ARCH}
 
 # --- Playwright system deps (must run as root, after node is available) ---
 RUN npx --yes playwright install-deps chromium 2>/dev/null || true
